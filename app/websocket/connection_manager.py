@@ -163,8 +163,10 @@ class ConnectionManager:
                     page=1,
                     page_size=500,
                 )
-                # Send full scanner results for now
-                # TODO: Implement delta tracking per client for scanner
+                # Full result set is sent each cycle. Scanner conditions can produce
+                # entirely different result sets between snapshots, making row-level
+                # delta tracking unreliable without per-client state caching.
+                # For scanner result sets (typically <500 rows), this is optimal.
                 await self._send(ws, {
                     "type": "scanner_update",
                     "data": records,
