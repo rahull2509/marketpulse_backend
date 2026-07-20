@@ -52,6 +52,15 @@ class Settings(BaseSettings):
     # ── WebSocket Configuration ─────────────────────────────────────────
     WS_HEARTBEAT_INTERVAL: int = 30  # seconds
 
+    # ── Cache Configuration ─────────────────────────────────────────────
+    CACHE_DIRECTORY: str = "/tmp/marketpulse_cache"
+    CACHE_MAX_SIZE_GB: float = 2.0
+    CACHE_MAX_FILE_AGE_DAYS: int = 30
+    CACHE_METADATA_FILE_EXT: str = ".meta.json"
+    CACHE_CLEANUP_INTERVAL: int = 3600  # 1 hour
+    DOWNLOAD_LOCK_TIMEOUT: int = 60  # seconds
+    S3_CHUNK_SIZE: int = 8192  # 8KB chunks
+
     model_config = {
         "env_file": ".env",
         "env_file_encoding": "utf-8",

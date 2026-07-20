@@ -66,14 +66,57 @@ def get_index_data(access_token: Optional[str] = None) -> list[dict]:
         response.raise_for_status()
         data = response.json().get("data", {})
 
+        # Build a normalized lookup: decode URL-encoded keys from response
+        # Upstox may return "NSE_INDEX|Nifty 50" or "NSE_INDEX%7CNifty+50"
+        normalized_data: dict = {}
+        for key, value in data.items():
+            decoded_key = urllib.parse.unquote(key).replace("+", " ")
+            normalized_data[decoded_key] = value
+            normalized_data[key] = value  # also keep original
+
+        # Build a previous-cache map for fallback values
+        prev_cache_map: dict = {}
+        if _index_cache:
+            for item in _index_cache:
+                prev_cache_map[item["name"]] = item
+
         indices = []
         for display_name, instrument_key in INDEX_INSTRUMENTS.items():
-            details = data.get(instrument_key, {})
-            if not details:
-                continue
+            # Try original key, then decoded key
+            decoded_instrument_key = urllib.parse.unquote(instrument_key).replace("+", " ")
+            details = (
+                normalized_data.get(instrument_key)
+                or normalized_data.get(decoded_instrument_key)
+                or {}
+            )
 
-            last_price = details.get("last_price", 0)
-            net_change = details.get("net_change", 0)
+            if not details:
+                # Use last known cached value to prevent index from disappearing
+                prev = prev_cache_map.get(display_name)
+                if prev:
+                    logger.debug(
+                        f"Index '{display_name}' missing from API response, "
+                        f"using cached value"
+                    )
+                    indices.append(prev)
+                    continue
+                else:
+                    logger.warning(
+                        f"Index '{display_name}' missing from API response and no cache"
+                    )
+                    indices.append({
+                        "name": display_name,
+                        "instrument_key": instrument_key,
+                        "value": None,
+                        "change": None,
+                        "change_pct": None,
+                        "direction": "flat",
+                        "last_updated": datetime.now(IST).isoformat(),
+                    })
+                    continue
+
+            last_price = details.get("last_price", 0) or 0
+            net_change = details.get("net_change", 0) or 0
             prev_close = last_price - net_change if last_price else 0
             change_pct = (net_change / prev_close * 100) if prev_close else 0
 

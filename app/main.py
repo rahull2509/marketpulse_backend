@@ -57,6 +57,9 @@ async def lifespan(app: FastAPI):
     # ── Startup ─────────────────────────────────────────────────────────
     logger.info("Starting MarketPulse backend...")
 
+    from app.services.history_service import get_cache_manager
+    get_cache_manager().startup_recovery()
+
     # Wire the WebSocket publisher to the async event loop
     import asyncio
     from app.websocket.publisher import set_event_loop, on_cache_updated
@@ -70,20 +73,15 @@ async def lifespan(app: FastAPI):
 
             scheduler_instance = UpstoxScheduler(settings)
 
-            # Register LiveCache update as callback
-            # When scheduler fetches new data, it calls live_cache.update(df)
-            scheduler_instance.register_callback(live_cache.update)
-
-            # Register WebSocket publisher as second callback
-            # LiveCache.update() returns changed_rows, but the scheduler
-            # calls callbacks with the DataFrame. We need a wrapper.
+            # Single callback: update the cache AND immediately push the
+            # changed rows to WebSocket clients using update()'s return value.
+            # This eliminates the double-diff race that previously caused
+            # WebSocket broadcasts to be suppressed (falling back to polling).
             def _on_scheduler_data(df):
-                """Bridge: scheduler callback → WebSocket publisher."""
-                # live_cache.update was already called (registered first),
-                # so we can read the diff result from cache
-                changed = live_cache._compute_diff()
-                if changed:
-                    on_cache_updated(changed)
+                """Bridge: scheduler data → LiveCache → WebSocket delta push."""
+                changed_rows = live_cache.update(df)
+                if changed_rows:
+                    on_cache_updated(changed_rows)
 
             scheduler_instance.register_callback(_on_scheduler_data)
 

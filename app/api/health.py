@@ -39,9 +39,11 @@ async def health_check(request: Request):
         except Exception:
             s3_status = "error"
 
+    market_status_str = get_market_status()
+
     health_data = {
         "status": "healthy",
-        "backend": "running",
+        "backend": "healthy",  # If we're responding, backend is healthy
         "scheduler": scheduler_status,
         "cache": {
             "populated": cache_info["is_populated"],
@@ -51,11 +53,13 @@ async def health_check(request: Request):
             "columns": cache_info["total_columns"],
         },
         "s3": s3_status,
-        "market_status": get_market_status(),
+        "market_status": market_status_str,
     }
 
-    # Mark unhealthy if critical components are down
-    if not cache_info["is_populated"] and scheduler_status != "running":
+    # Mark degraded only if scheduler is down AND market is LIVE
+    # (scheduler being disabled/stopped during closed hours is normal)
+    market_is_live = market_status_str in ("LIVE",)
+    if market_is_live and scheduler_status not in ("running", "disabled"):
         health_data["status"] = "degraded"
 
     return success_response(

@@ -9,6 +9,7 @@ GET /api/v1/history/timeline/{symbol} — Minute-by-minute stock timeline
 from typing import Optional
 
 from fastapi import APIRouter, Query
+from fastapi.responses import JSONResponse
 
 from app.config.holidays import get_market_status
 from app.schemas.response import success_response, error_response
@@ -34,9 +35,10 @@ async def get_history(
     Return historical market data from S3 Parquet.
 
     Supports filtering by symbol, date, and time range.
+    Downloads and caches data synchronously.
     """
     try:
-        records, meta = get_historical_data(
+        records, meta = await get_historical_data(
             symbol=symbol,
             target_date=date,
             start_time=start_time,
@@ -60,7 +62,7 @@ async def get_history(
 @router.get("/history/dates")
 async def get_available_dates():
     """Return list of dates that have historical data available."""
-    dates = list_available_dates()
+    dates = await list_available_dates()
     return success_response(
         data=dates,
         market_status=get_market_status(),
@@ -79,7 +81,7 @@ async def get_timeline(
     Used by the Stock Analytics page (Screen 2).
     """
     try:
-        timeline = get_stock_timeline(symbol=symbol, target_date=date)
+        timeline = await get_stock_timeline(symbol=symbol, target_date=date)
 
         if not timeline:
             return error_response(
