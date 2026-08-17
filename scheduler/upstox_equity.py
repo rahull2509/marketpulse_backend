@@ -22,11 +22,10 @@ import pyotp
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 import urllib
-import boto3
+from zoneinfo import ZoneInfo
 import pandas as pd
 from io import BytesIO
 from datetime import datetime, timezone
-import pytz
 import requests
 from apscheduler.schedulers.background import BackgroundScheduler
 import logging
@@ -34,7 +33,7 @@ from typing import Optional, Callable
 
 logger = logging.getLogger(__name__)
 
-IST = pytz.timezone("Asia/Kolkata")
+IST = ZoneInfo("Asia/Kolkata")
 
 
 class UpstoxScheduler:
@@ -117,9 +116,11 @@ class UpstoxScheduler:
         try:
             options = Options()
             options.add_argument("--no-sandbox")
-            options.add_argument("--headless")
+            options.add_argument("--headless=new")
+            options.add_argument("--disable-gpu")
+            options.add_argument("--window-size=1920,1080")
             options.add_argument("--disable-dev-shm-usage")
-            options.add_argument("--remote-debugging-port=9222")
+            options.add_argument("--disable-blink-features=AutomationControlled")
 
             driver = webdriver.Chrome(options=options)
 
@@ -132,37 +133,35 @@ class UpstoxScheduler:
 
             driver.get(url)
 
-            WebDriverWait(driver, 30).until(
-                lambda d: d.execute_script("return document.readyState") == "complete"
-            )
+            wait = WebDriverWait(driver, 30)
 
-            # Enter mobile number
-            username_input = driver.find_element(By.XPATH, '//*[@id="mobileNum"]')
+            # Wait for React to render the mobile number input
+            username_input = wait.until(EC.visibility_of_element_located((By.ID, "mobileNum")))
             username_input.clear()
             username_input.send_keys(self.settings.UPSTOX_CLIENT_ID)
 
-            driver.find_element(By.XPATH, '//*[@id="getOtp"]').click()
+            wait.until(EC.element_to_be_clickable((By.ID, "getOtp"))).click()
 
+            # Wait for OTP input to become visible
+            password_input = wait.until(EC.visibility_of_element_located((By.ID, "otpNum")))
+            
             # Enter TOTP
             totp = pyotp.TOTP(self.settings.UPSTOX_TOTP_SECRET).now()
-            time.sleep(5)
-
-            password_input = driver.find_element(By.XPATH, '//*[@id="otpNum"]')
             password_input.clear()
             password_input.send_keys(totp)
 
-            driver.find_element(By.XPATH, '//*[@id="continueBtn"]').click()
-            time.sleep(5)
+            wait.until(EC.element_to_be_clickable((By.ID, "continueBtn"))).click()
 
-            # Enter PIN
-            pin_input = driver.find_element(By.XPATH, '//*[@id="pinCode"]')
+            # Wait for PIN input to become visible
+            pin_input = wait.until(EC.visibility_of_element_located((By.ID, "pinCode")))
             pin_input.clear()
             pin_input.send_keys(self.settings.UPSTOX_CLIENT_PIN)
 
             original_url = driver.current_url
-            driver.find_element(By.XPATH, '//*[@id="pinContinueBtn"]').click()
+            wait.until(EC.element_to_be_clickable((By.ID, "pinContinueBtn"))).click()
 
-            WebDriverWait(driver, 30).until(EC.url_changes(original_url))
+            # Wait until the URL changes from the login page
+            wait.until(EC.url_changes(original_url))
 
             redirected_url = driver.current_url
             code = redirected_url.split("?code=")[1]
@@ -340,6 +339,8 @@ class UpstoxScheduler:
 
     def upload_to_s3(self, df: pd.DataFrame) -> None:
         """Upload DataFrame to S3 by appending to today's parquet file."""
+        import pyarrow.parquet as pq
+        import pyarrow as pa
         try:
             file_name = self._generate_daily_filename()
 
@@ -348,17 +349,25 @@ class UpstoxScheduler:
                 parquet_obj = self.s3_client.get_object(
                     Bucket=self.settings.S3_BUCKET_NAME, Key=file_name
                 )
-                existing_df = pd.read_parquet(BytesIO(parquet_obj["Body"].read()))
+                existing_table = pq.read_table(BytesIO(parquet_obj["Body"].read()))
             except self.s3_client.exceptions.NoSuchKey:
-                existing_df = pd.DataFrame()
+                existing_table = None
             except Exception as e:
                 logger.warning(f"Could not read existing parquet, starting fresh: {e}")
-                existing_df = pd.DataFrame()
+                existing_table = None
 
-            combined_df = pd.concat([existing_df, df], ignore_index=True)
+            try:
+                new_table = pa.Table.from_pandas(df, schema=existing_table.schema if existing_table else None)
+            except Exception:
+                new_table = pa.Table.from_pandas(df)
+                
+            if existing_table is not None:
+                combined_table = pa.concat_tables([existing_table, new_table], promote_options='default')
+            else:
+                combined_table = new_table
 
             parquet_buffer = BytesIO()
-            combined_df.to_parquet(parquet_buffer, index=False)
+            pq.write_table(combined_table, parquet_buffer)
 
             self.s3_client.put_object(
                 Bucket=self.settings.S3_BUCKET_NAME,
@@ -367,7 +376,7 @@ class UpstoxScheduler:
             )
             logger.info(
                 f"S3 upload complete: s3://{self.settings.S3_BUCKET_NAME}/{file_name} "
-                f"({len(combined_df)} total rows)"
+                f"({combined_table.num_rows} total rows)"
             )
 
         except Exception as e:

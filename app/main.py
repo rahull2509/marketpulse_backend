@@ -69,19 +69,27 @@ async def lifespan(app: FastAPI):
 
     if settings.SCHEDULER_ENABLED:
         try:
-            from scheduler.upstox_equity import UpstoxScheduler
+            from scheduler.upstox_variables import UpstoxScheduler
 
             scheduler_instance = UpstoxScheduler(settings)
 
             # Single callback: update the cache AND immediately push the
             # changed rows to WebSocket clients using update()'s return value.
             # This eliminates the double-diff race that previously caused
-            # WebSocket broadcasts to be suppressed (falling back to polling).
             def _on_scheduler_data(df):
                 """Bridge: scheduler data → LiveCache → WebSocket delta push."""
+                import time
+                t0 = time.time()
                 changed_rows = live_cache.update(df)
+                t_cache = time.time() - t0
+
+                t_cb = 0.0
                 if changed_rows:
+                    t0 = time.time()
                     on_cache_updated(changed_rows)
+                    t_cb = time.time() - t0
+                
+                return t_cache, t_cb
 
             scheduler_instance.register_callback(_on_scheduler_data)
 
@@ -93,6 +101,8 @@ async def lifespan(app: FastAPI):
             logger.info("API will start without live data (historical mode only)")
     else:
         logger.info("Scheduler disabled via settings")
+
+
 
     # Store references on app state for access from route handlers
     app.state.live_cache = live_cache
@@ -137,6 +147,14 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    # ── Proxy Keep-Alive Fix Middleware ─────────────────────────────────
+    from fastapi import Request
+    @app.middleware("http")
+    async def force_connection_close(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Connection"] = "close"
+        return response
+
     # ── API Routers ─────────────────────────────────────────────────────
     from app.api.dashboard import router as dashboard_router
     from app.api.stocks import router as stocks_router
@@ -145,6 +163,7 @@ def create_app() -> FastAPI:
     from app.api.metadata import router as metadata_router
     from app.api.market_status import router as market_status_router
     from app.api.health import router as health_router
+    from app.api.presets import router as presets_router
 
     api_prefix = "/api/v1"
     app.include_router(dashboard_router, prefix=api_prefix, tags=["Dashboard"])
@@ -154,6 +173,7 @@ def create_app() -> FastAPI:
     app.include_router(metadata_router, prefix=api_prefix, tags=["Metadata"])
     app.include_router(market_status_router, prefix=api_prefix, tags=["Market Status"])
     app.include_router(health_router, prefix=api_prefix, tags=["Health"])
+    app.include_router(presets_router, prefix=api_prefix, tags=["Presets"])
 
     # ── WebSocket Endpoint ──────────────────────────────────────────────
     from app.websocket.connection_manager import manager

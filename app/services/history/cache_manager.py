@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import time
+from pathlib import Path
 from typing import Optional, Tuple
 
 from app.config.settings import get_settings
@@ -9,6 +10,7 @@ from app.services.history.download_manager import DownloadManager
 from app.services.history.lock_manager import LockManager
 from app.services.history.metadata_manager import MetadataManager
 from app.services.history.validation_manager import ValidationManager
+from app.services.history.singleflight import SingleFlight
 
 logger = logging.getLogger(__name__)
 
@@ -24,16 +26,15 @@ class CacheManager:
         self.locks = LockManager()
         self.validation = ValidationManager()
         self.downloader = DownloadManager(self.validation)
+        self._flight = SingleFlight()
         
         # Ensure cache directory exists
-        os.makedirs(self.settings.CACHE_DIRECTORY, exist_ok=True)
+        self.cache_dir = Path(self.settings.CACHE_DIRECTORY)
+        self.cache_dir.mkdir(parents=True, exist_ok=True)
 
     def get_parquet_path(self, target_date: str) -> str:
         """Returns the full path to the parquet cache file."""
-        return os.path.join(
-            self.settings.CACHE_DIRECTORY,
-            f"{target_date}_Equity.parquet"
-        )
+        return str(self.cache_dir / f"{target_date}_Equity.parquet")
 
     def startup_recovery(self) -> None:
         """
@@ -45,12 +46,12 @@ class CacheManager:
         deleted_count = 0
 
         try:
-            files = os.listdir(self.settings.CACHE_DIRECTORY)
+            files = os.listdir(self.cache_dir)
         except FileNotFoundError:
             return
 
         for filename in files:
-            file_path = os.path.join(self.settings.CACHE_DIRECTORY, filename)
+            file_path = str(self.cache_dir / filename)
             
             # 1. Clean tmp orphans from crashed downloads
             if filename.endswith(".tmp"):
@@ -98,7 +99,7 @@ class CacheManager:
         until below CACHE_MAX_SIZE_GB.
         """
         try:
-            files = os.listdir(self.settings.CACHE_DIRECTORY)
+            files = os.listdir(self.cache_dir)
         except FileNotFoundError:
             return
 
@@ -108,7 +109,7 @@ class CacheManager:
         for filename in files:
             if filename.endswith(".parquet"):
                 target_date = filename.split("_")[0]
-                parquet_path = os.path.join(self.settings.CACHE_DIRECTORY, filename)
+                parquet_path = str(self.cache_dir / filename)
                 meta = self.metadata.load_metadata(target_date)
                 
                 if not meta:
@@ -158,8 +159,25 @@ class CacheManager:
 
     async def get_or_download(self, target_date: str) -> Optional[str]:
         """
-        Core flow: Lock -> Check Meta -> Head Object -> Download -> Unlock.
+        Core flow: SingleFlight → Lock → Check Meta → Head Object → Download → Unlock.
         Returns the local path to the valid parquet file, or None if unavailable.
+        
+        SingleFlight ensures that if 50 requests arrive for the same date
+        simultaneously, only one performs the S3 HEAD + download pipeline.
+        The remaining 49 await the same result.
+        """
+        result, was_coalesced = await self._flight.do(
+            key=target_date,
+            fn=lambda: self._do_get_or_download(target_date)
+        )
+        if was_coalesced:
+            logger.info(f"Request coalesced for {target_date} — skipped S3 pipeline")
+        return result
+
+    async def _do_get_or_download(self, target_date: str) -> Optional[str]:
+        """
+        The actual S3 HEAD + download pipeline. Only one instance of this
+        runs per target_date at any given time (enforced by SingleFlight).
         """
         s3_key = f"{self.settings.S3_PARQUET_PREFIX}/{target_date}_Equity.parquet"
         parquet_path = self.get_parquet_path(target_date)
@@ -179,8 +197,6 @@ class CacheManager:
             local_meta = self.metadata.load_metadata(target_date)
             
             # 2. Check S3 state
-            # Notice we block here with synchronous Boto3. 
-            # In a highly async system, we'd use aiobotocore, but we can run it in a threadpool to avoid blocking event loop.
             found, s3_meta = await asyncio.to_thread(self.downloader.head_object, s3_key)
 
             if not found:
@@ -192,15 +208,20 @@ class CacheManager:
             # 3. Compare Cache vs S3
             is_valid_cache = False
             if local_meta and local_meta.get("etag") == s3_etag:
-                if self.validation.verify_cache_integrity(parquet_path):
-                    is_valid_cache = True
-                    self.metadata.touch_metadata(target_date)
-                    logger.debug(f"Cache Hit: {target_date}")
+                if os.path.exists(parquet_path):
+                    if self.validation.verify_cache_integrity(parquet_path):
+                        is_valid_cache = True
+                        self.metadata.touch_metadata(target_date)
+                        logger.debug(f"Cache Hit: {target_date}")
+                    else:
+                        logger.warning(f"Cached parquet {target_date} corrupted. Deleting.")
+                        os.remove(parquet_path)
+                        self.metadata.delete_metadata(target_date)
 
             if is_valid_cache:
                 return parquet_path
 
-            # 4. Cache Miss or Invalid -> Download
+            # 4. Cache Miss or Invalid → Download
             logger.info(f"Cache Miss: {target_date}. Starting download...")
             success, duration = await asyncio.to_thread(
                 self.downloader.stream_download_atomic, s3_key, parquet_path
